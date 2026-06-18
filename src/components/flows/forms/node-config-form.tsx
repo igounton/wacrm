@@ -45,7 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { createClient } from "@/lib/supabase/client";
+import { uploadAccountMedia, MEDIA_MAX_BYTES } from "@/lib/storage/upload-media";
 import { slugify, type BuilderNode } from "../shared";
 import { NextNodeRow, NodeKeySelect, TextRow } from "./fields";
 
@@ -872,8 +872,6 @@ const MEDIA_ACCEPT: Record<NonNullable<SendMediaCfg["media_type"]>, string> = {
 };
 
 const FLOW_MEDIA_BUCKET = "flow-media";
-// 16 MB — matches the bucket file_size_limit set in migration 016.
-const FLOW_MEDIA_MAX_BYTES = 16 * 1024 * 1024;
 
 function SendMediaForm({
   cfg,
@@ -897,7 +895,7 @@ function SendMediaForm({
 
   const handleFile = useCallback(
     async (file: File) => {
-      if (file.size > FLOW_MEDIA_MAX_BYTES) {
+      if (file.size > MEDIA_MAX_BYTES) {
         toast.error(
           `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — limit is 16 MB.`,
         );
@@ -905,49 +903,9 @@ function SendMediaForm({
       }
       setUploading(true);
       try {
-        const supabase = createClient();
-        const {
-          data: { user },
-          error: userErr,
-        } = await supabase.auth.getUser();
-        if (userErr || !user) {
-          throw new Error("Not signed in.");
-        }
-        // Resolve the caller's account_id so the path is account-
-        // scoped rather than user-scoped. The 020 migration's RLS
-        // policy allows any account member to write under
-        // `account-<account_id>/...`, so a flow's media survives a
-        // teammate leaving the account (which was a data-integrity
-        // hole in the original 016 storage policies).
-        const { data: profile, error: profileErr } = await supabase
-          .from("profiles")
-          .select("account_id")
-          .eq("user_id", user.id)
-          .maybeSingle();
-        if (profileErr || !profile?.account_id) {
-          throw new Error("Could not resolve your account.");
-        }
-        // Path convention matches migration 020's RLS policy: first
-        // segment is `account-<uuid>`. Timestamp + random suffix
-        // prevents collisions between two builders open at once.
-        const ext = file.name.split(".").pop()?.toLowerCase() ?? "bin";
-        const safeBase =
-          file.name
-            .replace(/\.[^.]+$/, "")
-            .replace(/[^a-zA-Z0-9_-]+/g, "_")
-            .slice(0, 40) || "file";
-        const path = `account-${profile.account_id}/${Date.now()}-${safeBase}.${ext}`;
-        const { error: upErr } = await supabase.storage
-          .from(FLOW_MEDIA_BUCKET)
-          .upload(path, file, {
-            cacheControl: "3600",
-            upsert: false,
-            contentType: file.type,
-          });
-        if (upErr) throw new Error(upErr.message);
-        const {
-          data: { publicUrl },
-        } = supabase.storage.from(FLOW_MEDIA_BUCKET).getPublicUrl(path);
+        // Account-scoped upload (path `account-<id>/...`) — see
+        // uploadAccountMedia + migration 020's flow-media RLS policy.
+        const { publicUrl } = await uploadAccountMedia(FLOW_MEDIA_BUCKET, file);
         // Patch all fields in one call so the form doesn't re-render
         // with a half-uploaded state.
         onUpdateConfig({

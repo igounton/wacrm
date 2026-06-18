@@ -25,8 +25,12 @@ const SECURITY_HEADERS = [
   { key: "X-Frame-Options", value: "DENY" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   {
+    // Microphone is allowed for same-origin (`self`) so the inbox
+    // composer can record voice notes via MediaRecorder. Everything
+    // else stays denied — a compromised dependency can't silently grab
+    // the camera / geolocation / etc.
     key: "Permissions-Policy",
-    value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    value: "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
   },
   {
     key: "Content-Security-Policy-Report-Only",
@@ -42,6 +46,9 @@ const SECURITY_HEADERS = [
       // https URLs paste-able from the UI), OG images, data URLs for
       // tiny inline assets.
       "img-src 'self' data: blob: https:",
+      // Outbound media previews (blob: from MediaRecorder + file picker)
+      // and Supabase public-bucket audio/video the inbox renders.
+      "media-src 'self' blob: https://*.supabase.co",
       "font-src 'self' data:",
       // Supabase REST + realtime (WSS). All Meta API calls happen
       // server-side, so graph.facebook.com does not belong here.

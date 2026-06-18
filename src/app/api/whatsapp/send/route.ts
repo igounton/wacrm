@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import {
+  sendTextMessage,
+  sendTemplateMessage,
+  sendMediaMessage,
+  type MediaKind,
+} from '@/lib/whatsapp/meta-api'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
 import {
@@ -16,6 +21,7 @@ import {
 } from '@/lib/rate-limit'
 import type { MessageTemplate } from '@/types'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
+import { hasBetaFeature, CHAT_MEDIA_BETA } from '@/lib/auth/beta-features'
 
 export async function POST(request: Request) {
   try {
@@ -46,7 +52,7 @@ export async function POST(request: Request) {
     // returned nothing for teammates who didn't author the row.
     const { data: profile } = await supabase
       .from('profiles')
-      .select('account_id')
+      .select('account_id, beta_features')
       .eq('user_id', user.id)
       .maybeSingle()
     const accountId = profile?.account_id as string | undefined
@@ -63,6 +69,7 @@ export async function POST(request: Request) {
       message_type,
       content_text,
       media_url,
+      filename,
       template_name,
       template_language,
       template_params,
@@ -77,6 +84,21 @@ export async function POST(request: Request) {
       )
     }
 
+    // Media kinds (image/video/document/audio) are sent to Meta via a
+    // public URL the composer already uploaded to the chat-media bucket.
+    const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const
+    const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(message_type)
+
+    // Reject anything outside the known set up front rather than letting
+    // an unknown type fall through to the text path with empty content.
+    const VALID_MESSAGE_TYPES = ['text', 'template', ...MEDIA_KINDS] as const
+    if (!(VALID_MESSAGE_TYPES as readonly string[]).includes(message_type)) {
+      return NextResponse.json(
+        { error: `Unsupported message_type "${message_type}"` },
+        { status: 400 }
+      )
+    }
+
     if (message_type === 'text' && !content_text) {
       return NextResponse.json(
         { error: 'content_text is required for text messages' },
@@ -87,6 +109,38 @@ export async function POST(request: Request) {
     if (message_type === 'template' && !template_name) {
       return NextResponse.json(
         { error: 'template_name is required for template messages' },
+        { status: 400 }
+      )
+    }
+
+    if (isMediaKind && !media_url) {
+      return NextResponse.json(
+        { error: `media_url is required for ${message_type} messages` },
+        { status: 400 }
+      )
+    }
+
+    // Media sends are beta-gated (issue #213). Text + templates stay
+    // available to everyone; only accounts opted into 'chat_media' may
+    // send media — mirrors the client gate so the endpoint can't be
+    // driven ahead of the rollout.
+    if (isMediaKind && !hasBetaFeature(profile?.beta_features, CHAT_MEDIA_BETA)) {
+      return NextResponse.json(
+        { error: 'Media messages are not enabled for your account.' },
+        { status: 403 }
+      )
+    }
+
+    // Meta caps media captions at 1024 chars; reject before the upload is
+    // wasted at the Meta call. (Audio carries no caption — see meta-api.)
+    if (
+      isMediaKind &&
+      message_type !== 'audio' &&
+      typeof content_text === 'string' &&
+      content_text.length > 1024
+    ) {
+      return NextResponse.json(
+        { error: 'Caption exceeds the 1024-character limit' },
         { status: 400 }
       )
     }
@@ -242,6 +296,22 @@ export async function POST(request: Request) {
           // Legacy body-only fallback — only consulted when
           // messageParams.body isn't set.
           params: template_params || [],
+          contextMessageId,
+        })
+        return result.messageId
+      }
+      if (isMediaKind) {
+        // content_text doubles as the caption (ignored for audio inside
+        // sendMediaMessage). filename surfaces in the recipient's chat
+        // for documents only.
+        const result = await sendMediaMessage({
+          phoneNumberId: config.phone_number_id,
+          accessToken,
+          to: phone,
+          kind: message_type as MediaKind,
+          link: media_url,
+          caption: content_text || undefined,
+          filename: filename || undefined,
           contextMessageId,
         })
         return result.messageId
