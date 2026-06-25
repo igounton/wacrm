@@ -131,12 +131,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const { data, error } = await supabase
         .from("profiles")
         .select(
-          // `account:accounts!inner(id, name)` — explicit join on the
-          // single FK profiles.account_id → accounts.id. `!inner` so a
-          // missing account collapses to null rather than a half-
-          // populated row (shouldn't happen post-017 NOT NULL, but
-          // belt-and-braces against forks running older schemas).
-          "id, full_name, email, avatar_url, role, beta_features, account_id, account_role, account:accounts!inner(id, name, default_currency)",
+          "id, full_name, email, avatar_url, role, beta_features, account_id, account_role",
         )
         .eq("user_id", userId)
         .maybeSingle();
@@ -152,27 +147,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       if (data) {
-        // Supabase's typed client surfaces an embedded `!inner` row
-        // as either an object or a single-element array depending on
-        // the schema's inferred cardinality — normalise to the object
-        // form before reading.
-        const accountRaw = Array.isArray(data.account)
-          ? data.account[0] ?? null
-          : (data.account as {
-              id: string;
-              name: string;
-              default_currency: string | null;
-            } | null);
-        // Narrow default_currency defensively: forks running pre-021
-        // schemas won't have the column, so a missing/null value reads
-        // as the safe USD fallback rather than crashing the picker.
-        const accountRow: AccountSummary | null = accountRaw
-          ? {
-              id: accountRaw.id,
-              name: accountRaw.name,
-              default_currency: accountRaw.default_currency ?? DEFAULT_CURRENCY,
-            }
-          : null;
+        // Load the account with a plain lookup by id instead of an
+        // embedded FK join. The embed (`account:accounts!inner(...)`)
+        // forces PostgREST to resolve the profiles.account_id →
+        // accounts.id relationship from its schema cache; a stale cache
+        // (common right after a migration adds the FK) makes it fail
+        // hard with PGRST200 and blanks the whole profile — the user
+        // then loses account context everywhere (issue #294). A point
+        // lookup by id needs no relationship inference, so the profile
+        // (with account_id / account_role) still resolves even if the
+        // account name lookup itself can't.
+        let accountRow: AccountSummary | null = null;
+        if (data.account_id) {
+          const { data: account, error: accountErr } = await supabase
+            .from("accounts")
+            // default_currency added in migration 021; narrowed to the
+            // USD fallback below for older schemas where it reads null.
+            .select("id, name, default_currency")
+            .eq("id", data.account_id)
+            .maybeSingle();
+          if (accountErr) {
+            console.error("[AuthProvider] fetchAccount error:", {
+              message: accountErr.message,
+              details: accountErr.details,
+              hint: accountErr.hint,
+              code: accountErr.code,
+            });
+          } else if (account) {
+            accountRow = {
+              id: account.id,
+              name: account.name,
+              default_currency: account.default_currency ?? DEFAULT_CURRENCY,
+            };
+          }
+        }
 
         // Narrow the DB enum into our AccountRole union. The DB
         // constraint should make this unconditional, but a future

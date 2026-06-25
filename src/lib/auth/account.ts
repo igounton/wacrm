@@ -114,14 +114,9 @@ export async function getCurrentAccount(): Promise<AccountContext> {
     throw new UnauthorizedError();
   }
 
-  // Selecting through the FK gives us the account name in one
-  // query — `account:accounts!inner(id,name)` is Supabase's
-  // explicit-join syntax. `!inner` so a NULL account_id (which
-  // shouldn't exist) yields no row and trips the guard below
-  // rather than silently returning a half-populated profile.
   const { data, error } = await supabase
     .from("profiles")
-    .select("account_id, account_role, account:accounts!inner(id, name)")
+    .select("account_id, account_role")
     .eq("user_id", user.id)
     .maybeSingle();
 
@@ -129,7 +124,7 @@ export async function getCurrentAccount(): Promise<AccountContext> {
     console.error("[getCurrentAccount] profile fetch error:", error);
     throw new ForbiddenError("Could not load account context");
   }
-  if (!data || !data.account_id || !data.account_role || !data.account) {
+  if (!data || !data.account_id || !data.account_role) {
     // Pre-migration profile, or a manual insert that skipped the
     // signup trigger. The user is authenticated but the app has
     // no way to scope their queries — treat as forbidden.
@@ -142,16 +137,38 @@ export async function getCurrentAccount(): Promise<AccountContext> {
     throw new ForbiddenError(`Unknown account role: ${data.account_role}`);
   }
 
-  // Supabase's typed client returns related rows as an array even
-  // for `!inner` single-record joins; normalise to a single object.
-  const accountRow = Array.isArray(data.account) ? data.account[0] : data.account;
+  // Load the account with a plain point lookup by id rather than an
+  // embedded FK join (`account:accounts!inner(...)`). The embed forces
+  // PostgREST to resolve the profiles.account_id → accounts.id
+  // relationship from its schema cache; when that cache is stale — a
+  // common Supabase state right after a migration adds the FK, or when
+  // migrations are applied out of band — the embed fails hard with
+  // PGRST200 ("could not find a relationship … in the schema cache")
+  // and takes down the entire account context (issue #294). A lookup by
+  // id needs no relationship inference and is gated by the same accounts
+  // RLS, so it stays robust against cache staleness and older schemas.
+  const { data: account, error: accountErr } = await supabase
+    .from("accounts")
+    .select("id, name")
+    .eq("id", data.account_id)
+    .maybeSingle();
+
+  if (accountErr) {
+    console.error("[getCurrentAccount] account fetch error:", accountErr);
+    throw new ForbiddenError("Could not load account context");
+  }
+  if (!account) {
+    // account_id points at no readable account row — orphaned profile
+    // or an RLS gap. Same "can't scope this user" outcome as above.
+    throw new ForbiddenError("Profile is not linked to an account");
+  }
 
   return {
     supabase,
     userId: user.id,
     accountId: data.account_id,
     role: data.account_role,
-    account: { id: accountRow.id, name: accountRow.name },
+    account: { id: account.id, name: account.name },
   };
 }
 
